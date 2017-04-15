@@ -19,7 +19,7 @@
   "minimum-stability": "dev",
   "require": {
     "php": ">=7.0.0",
-    "amphp/amp": "dev-dv_master as dev-master",
+    "amphp/amp": "dev-master",
     "amphp/aerys": "dev-amp_v2",
     "amphp/artax": "dev-amp_v2"
   },
