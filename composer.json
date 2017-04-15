@@ -10,11 +10,18 @@
   "support": {
     "issues": "https://github.com/amphp/aerys-reverse/issues"
   },
+  "repositories": [
+    {
+      "type": "vcs",
+      "url": "https://github.com/DataValidata/amp"
+    }
+  ],
   "minimum-stability": "dev",
   "require": {
-    "amphp/amp": "^1",
-    "amphp/aerys": "dev-master",
-    "amphp/artax": "^2"
+    "php": ">=7.0.0",
+    "amphp/amp": "dev-dv_master as dev-master",
+    "amphp/aerys": "dev-amp_v2",
+    "amphp/artax": "dev-amp_v2"
   },
   "require-dev": {
     "phpunit/phpunit": "~4.4.0",
@@ -22,7 +29,7 @@
   },
   "autoload": {
     "classmap": [
-      {"Aerys\\Reverse": "Reverse.php"}
+      {"Aerys\\Reverse": "ReverseProxy.php"}
     ]
   }
 }

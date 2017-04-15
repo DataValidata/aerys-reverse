@@ -1,9 +1,14 @@
 <?php
 
-namespace Aerys;
+namespace Aerys\Reverse;
 
+use Aerys\InternalRequest;
+use Aerys\Middleware;
+use Aerys\Request;
+use Aerys\Response;
 use Amp\Artax\Client;
 use Amp\Artax\Notify;
+use Amp\Loop;
 
 class ReverseProxy implements Middleware {
 	const MAX_INTERMEDIARY_BUFFER = 64 * 1024;
@@ -42,19 +47,23 @@ class ReverseProxy implements Middleware {
 
 	public function __invoke(Request $req, Response $res) {
 		$headers = $req->getAllHeaders();
-		unset($headers["accept-encoding"]);
-		$connection = $headers["connection"];
-		unset($headers["connection"]);
-		foreach ($connection as $value) {
-			foreach (explode(",", strtolower($value)) as $type) {
-				$type = trim($type);
-				if ($type == "upgrade") {
-					$headers["connection"][0] = "upgrade";
-				} else {
-					unset($headers[$type]);
-				}
-			}
-		}
+        if(array_key_exists('accept-encoding', $headers)) {
+            unset($headers["accept-encoding"]);
+        }
+        if(array_key_exists('connection', $headers)) {
+            $connection = $headers["connection"];
+            unset($headers["connection"]);
+            foreach ($connection as $value) {
+                foreach (explode(",", strtolower($value)) as $type) {
+                    $type = trim($type);
+                    if ($type == "upgrade") {
+                        $headers["connection"][0] = "upgrade";
+                    } else {
+                        unset($headers[$type]);
+                    }
+                }
+            }
+        }
 
 		if ($this->headers) {
 			if (is_callable($this->headers)) {
@@ -64,13 +73,17 @@ class ReverseProxy implements Middleware {
 			}
 		}
 
-		$promise = $this->client->request((new \Amp\Artax\Request)
-			->setMethod($req->getMethod())
-			->setUri($this->target . $req->getUri())
-			->setAllHeaders($headers)
-			->setBody(yield $req->getBody())); // no async sending possible :-( [because of redirects]
-
-		$promise->watch(function($update) use ($req, $res, &$hasBody, &$status, &$zlib) {
+        $reqBody = yield $req->getBody();
+        $artaxRequest = (new \Amp\Artax\Request)
+            ->setMethod($req->getMethod())
+            ->setUri($this->target . $req->getUri())
+            ->setAllHeaders($headers)
+        ;
+        if($reqBody) {
+            $artaxRequest->setBody($reqBody);
+        }
+        $stream = $this->client->request($artaxRequest);
+		$stream->onEmit(function($update) use ($req, $res, &$hasBody, &$status, &$zlib) {
 			list($type, $data) = $update;
 
 			if ($type == Notify::RESPONSE_HEADERS) {
@@ -93,7 +106,7 @@ class ReverseProxy implements Middleware {
 				if ($zlib) {
 					$data = inflate_add($zlib, $data);
 				}
-				$res->stream($data);
+				$res->write($data);
 			}
 
 			if ($type == Notify::RESPONSE) {
@@ -109,11 +122,11 @@ class ReverseProxy implements Middleware {
 				if ($status == 101) {
 					$req->setLocalVar("aerys.reverse.socket", $update["export_socket"]());
 				}
-				$res->end($zlib ? inflate_add("", ZLIB_FINISH) : null);
+				$res->end($zlib ? inflate_add($zlib, "", ZLIB_FINISH) : "");
 			}
 		});
 
-		yield $promise;
+		yield $stream;
 	}
 
 	// handle switching protocols by detaching socket from server and doing bidirectional forwarding on socket
@@ -129,7 +142,7 @@ class ReverseProxy implements Middleware {
 			$yield = yield $yield;
 		}
 
-		\Amp\immediately([$this, "reapClient"], ["cb_data" => $ireq]);
+		Loop::defer([$this, "reapClient"], ["cb_data" => $ireq]);
 	}
 
 	public function reapClient($watcherId, InternalRequest $ireq) {
@@ -138,10 +151,10 @@ class ReverseProxy implements Middleware {
 		$serverRefClearer = ($ireq->client->exporter)($ireq->client)();
 
 		$internBuf = "";
-		$clientWrite = \Amp\onWritable($client, [self::class, "writer"], ["cb_data" => [&$externBuf, &$reverseRead, &$extern], "enable" => false, "keep_alive" => false]);
-		$reverseWrite = \Amp\onWritable($reverse, [self::class, "writer"], ["cb_data" => [&$internBuf, &$clientRead, &$intern], "enable" => false, "keep_alive" => false]);
-		$clientRead = \Amp\onReadable($client, [self::class, "reader"], ["cb_data" => [&$internBuf, $reverseWrite, &$intern], "keep_alive" => false]);
-		$reverseRead = \Amp\onReadable($reverse, [self::class, "reader"], ["cb_data" => [&$externBuf, $clientWrite, &$intern], "keep_alive" => false]);
+		$clientWrite = Loop::onWritable($client, [self::class, "writer"], ["cb_data" => [&$externBuf, &$reverseRead, &$extern], "enable" => false, "keep_alive" => false]);
+		$reverseWrite = Loop::onWritable($reverse, [self::class, "writer"], ["cb_data" => [&$internBuf, &$clientRead, &$intern], "enable" => false, "keep_alive" => false]);
+		$clientRead = Loop::onReadable($client, [self::class, "reader"], ["cb_data" => [&$internBuf, $reverseWrite, &$intern], "keep_alive" => false]);
+		$reverseRead = Loop::onReadable($reverse, [self::class, "reader"], ["cb_data" => [&$externBuf, $clientWrite, &$intern], "keep_alive" => false]);
 
 	}
 
@@ -150,21 +163,21 @@ class ReverseProxy implements Middleware {
 		$bytes = @fwrite($socket, $buffer);
 
 		if ($bytes == 0 && (!is_resource($socket) || @feof($socket))) {
-			\Amp\cancel($watcher);
-			\Amp\cancel($info[1]);
+            Loop::cancel($watcher);
+            Loop::cancel($info[1]);
 			return;
 		}
 
 		$buffer = substr($buffer, $bytes);
 		if ($buffer === "") {
 			if ($info[2]) {
-				\Amp\cancel($watcher);
+                Loop::cancel($watcher);
 			} else {
-				\Amp\disable($watcher);
+                Loop::disable($watcher);
 			}
 		}
 		if (\strlen($buffer) < self::MAX_INTERMEDIARY_BUFFER) {
-			\Amp\enable($info[1]);
+            Loop::enable($info[1]);
 		}
 
 	}
@@ -174,16 +187,16 @@ class ReverseProxy implements Middleware {
 		$data = @fread($socket, 8192);
 		if ($data != "") {
 			if ($buffer == "") {
-				\Amp\enable($info[1]);
+                Loop::enable($info[1]);
 			}
 			$buffer .= $data;
 			if (\strlen($buffer) > self::MAX_INTERMEDIARY_BUFFER) {
-				\Amp\disable($watcher);
+                Loop::disable($watcher);
 			}
 		} elseif (!is_resource($socket) || @feof($socket)) {
-			\Amp\cancel($watcher);
+            Loop::cancel($watcher);
 			if ($buffer == "") {
-				\Amp\cancel($info[1]);
+                Loop::cancel($info[1]);
 			} else {
 				$info[2] = true;
 			}
