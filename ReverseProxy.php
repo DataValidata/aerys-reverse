@@ -2,20 +2,25 @@
 
 namespace Aerys\Reverse;
 
-use Aerys\InternalRequest;
-use Aerys\Middleware;
-use Aerys\Request;
-use Aerys\Response;
-use Amp\Artax\Client;
-use Amp\Artax\Notify;
 use Amp\Loop;
+use Psr\Log\LoggerInterface as PsrLogger;
+use Aerys\{ Bootable, InternalRequest, Middleware, Request, Response, Server };
+use Amp\Artax\{ Client, Request as ArtaxRequest, Response as ArtaxResponse };
 
-class ReverseProxy implements Middleware {
+class ReverseProxy implements Middleware, Bootable {
 	const MAX_INTERMEDIARY_BUFFER = 64 * 1024;
 
 	private $target;
 	private $headers;
 	private $client;
+
+	/** @var  PsrLogger */
+	private $logger;
+
+    function boot(Server $server, PsrLogger $logger)
+    {
+        $this->logger = $logger;
+    }
 
 	public function __construct(string $uri, $headers = [], Client $client = null) {
 		$this->target = rtrim($uri, "/");
@@ -40,12 +45,11 @@ class ReverseProxy implements Middleware {
 
 		$this->client = $client ?? new Client(new \Amp\Artax\Cookie\NullCookieJar);
 		$this->client->setAllOptions([
-			Client::OP_DISCARD_BODY => true,
 			Client::OP_HOST_CONNECTION_LIMIT => INF,
 		]);
 	}
 
-	public function __invoke(Request $req, Response $res) {
+    public function __invoke(Request $req, Response $res) {
 		$headers = $req->getAllHeaders();
         if(array_key_exists('accept-encoding', $headers)) {
             unset($headers["accept-encoding"]);
@@ -74,65 +78,56 @@ class ReverseProxy implements Middleware {
 		}
 
         $reqBody = yield $req->getBody();
-        $artaxRequest = (new \Amp\Artax\Request)
-            ->setMethod($req->getMethod())
-            ->setUri($this->target . $req->getUri())
-            ->setAllHeaders($headers)
-        ;
-        if($reqBody) {
-            $artaxRequest->setBody($reqBody);
+        $artaxRequest = (new ArtaxRequest($this->target . $req->getUri(), $req->getMethod()));
+        $this->logger->debug("Build ArtaxRequest : ".$req->getMethod()." ".$this->target.$req->getUri());
+        foreach($headers as $field => $value){
+            if(is_array($value)) {
+                foreach($value as $headerValue) {
+                    $artaxRequest = $artaxRequest->withAddedHeader($field, $headerValue);
+                    $this->logger->debug("AddRequestHeader: [$field : $headerValue]");
+                }
+            } else {
+                $artaxRequest = $artaxRequest->withHeader($field, $value);
+                $this->logger->debug("AddRequestHeader: [$field : $value]");
+            }
         }
-        $stream = $this->client->request($artaxRequest);
-		$stream->onEmit(function($update) use ($req, $res, &$hasBody, &$status, &$zlib) {
-			list($type, $data) = $update;
+        if($reqBody) {
+            $artaxRequest = $artaxRequest->withBody($reqBody);
+            $this->logger->debug("AddRequestBody");
+        }
 
-			if ($type == Notify::RESPONSE_HEADERS) {
-				$headers = array_change_key_case($data["headers"], CASE_LOWER);
-				foreach ($data["headers"] as $header => $values) {
-					foreach ($values as $value) {
-						$res->addHeader($header, $value);
-					}
-				}
-				$res->setStatus($status = $data["status"]);
-				$res->setReason($data["reason"]);
 
-				if (isset($headers["content-encoding"]) && strcasecmp(trim(current($headers["content-encoding"])), 'gzip') === 0) {
-					$zlib = inflate_init(ZLIB_ENCODING_GZIP);
-				}
-				$hasBody = true;
-			}
 
-			if ($type == Notify::RESPONSE_BODY_DATA) {
-				if ($zlib) {
-					$data = inflate_add($zlib, $data);
-				}
-				$res->write($data);
-			}
+        /** @var ArtaxResponse $artaxResponse */
+        $artaxResponse = yield $this->client->request($artaxRequest);
+        $this->logger->debug("Got Artax Response");
+        $allHeaders = $artaxResponse->getAllHeaders();
+        foreach($allHeaders as $header => $values) {
+            foreach ($values as $value) {
+                $res->addHeader(strtolower($header), $value);
+                $this->logger->debug("AddResponseHeader: [$header : $value]");
+            }
+        }
 
-			if ($type == Notify::RESPONSE) {
-				if (!$hasBody) {
-					foreach ($data->getAllHeaders() as $header => $values) {
-						foreach ($values as $value) {
-							$res->addHeader($header, $value);
-						}
-					}
-					$res->setStatus($status = $data->getStatus());
-					$res->setReason($data->getReason());
-				}
-				if ($status == 101) {
-					$req->setLocalVar("aerys.reverse.socket", $update["export_socket"]());
-				}
-				$res->end($zlib ? inflate_add($zlib, "", ZLIB_FINISH) : "");
-			}
-		});
+        $res->setStatus($status = $artaxResponse->getStatus());
+        $this->logger->debug("SetResponseStatus: $status");
+        $res->setReason($reason = $artaxResponse->getReason());
+        $this->logger->debug("SetResponseReason: $reason");
 
-		yield $stream;
+        $body = $artaxResponse->getBody();
+        while (($data = yield $body->read()) !== null) {
+            $res->write($data);
+            $this->logger->debug("Wrote response bytes : ".strlen($data));
+        }
+
+        $res->end( "");
 	}
 
 	// handle switching protocols by detaching socket from server and doing bidirectional forwarding on socket
 	public function do(InternalRequest $ireq) {
 		$headers = yield;
 		if ($headers[":status"] == 101) {
+		    $this->logger->alert("Yielding Headers");
 			$yield = yield $headers;
 		} else {
 			return $headers; // detach Middleware otherwise
