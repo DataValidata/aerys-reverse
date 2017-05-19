@@ -22,8 +22,8 @@
     "fabpot/php-cs-fixer": "~1.9"
   },
   "autoload": {
-    "classmap": [
-      {"Aerys\\Reverse": "ReverseProxy.php"}
-    ]
+    "psr-4": {
+      "Aerys\\Reverse\\" : "src"
+    }
   }
 }

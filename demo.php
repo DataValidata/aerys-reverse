@@ -13,4 +13,4 @@ const AERYS_OPTIONS = [
 
 /* --- http://localhost:5000/ ------------------------------------------------------------------- */
 
-(new Aerys\Host)->expose("*", 5000)->use(new Aerys\Reverse\ReverseProxy("http://amphp.org/", ["Host" => ["amphp.org"]]));
+(new Aerys\Host)->expose("*", 5000)->use(new Aerys\Reverse\Proxy("http://amphp.org/", ["Host" => ["amphp.org"]]));
